@@ -1,109 +1,229 @@
 const http = require('http');
 const express = require('express');
-const dotenv = require('dotenv').config()
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const dotenv = require('dotenv').config();
 const WebSocket = require('ws');
-// const db = require('./config/database')
-// const util = require('util')
-// const dbquery = util.promisify(db.query).bind(db)
+const db = require('./config/database');
+const util = require('util');
+const moment = require('moment');
+const dbquery = util.promisify(db.query).bind(db);
 
 const port = process.env.PORT || 2000;
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/ws' });
+const currentTime = () => moment().utc().format('YYYY-MM-DD hh:mm:ss');
+
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
 
 app.get('/', (req, res) => {
 	res.status(200).send({ message: 'server on', status: 200 });
 });
 
-// app.get('/users', async (req, res) => {
-// 	try {
-// 		const users = await dbquery(`SELECT * FROM users`)
-// 		res.status(200).send(users)
-// 	} catch (error) {
-// 		res.status(500).send(error)
-// 	}
-// })
+app.post('/users', async (req, res) => {
+	try {
+		const check = await dbquery(`SELECT * FROM users WHERE name=?`, [
+			req.body.name,
+		]);
 
-const usersList = [];
+		if (check.length > 0) {
+			const date = currentTime();
+			const update = await dbquery(`UPDATE users SET ? WHERE id = ?`, [
+				{
+					status: 1,
+					updated_at: date,
+				},
+				check[0].id,
+			]);
+			console.log(update);
+
+			return res.status(200).send({
+				user: {
+					...check[0],
+					status: 1,
+					updated_at: date,
+				},
+			});
+		}
+
+		const insert = await dbquery(`INSERT INTO users SET ?`, {
+			name: req.body.name,
+			status: 1,
+			created_at: currentTime(),
+		});
+
+		const user = await dbquery(`SELECT * FROM users WHERE id=?`, [
+			insert.insertId,
+		]);
+
+		await dbquery(`INSERT INTO channel_users SET ?`, {
+			channel_id: 1,
+			user_id: insert.insertId,
+		});
+
+		res.status(200).send({ user: user[0] });
+	} catch (err) {
+		res.status(500).send(err);
+	}
+});
+
+app.get('/channelchats/:channel_id', async (req, res) => {
+	try {
+		const channelId = Number(req.params.channel_id);
+		if (!channelId) {
+			return res.status(400).send({ message: 'Please provide channel id' });
+		}
+		const chats = await dbquery(
+			`
+			SELECT mc.id, mc.user_id, mc.message, mc.created_at, u.name as username
+			FROM message_channels mc JOIN users u ON mc.user_id = u.id
+			WHERE channel_id=1 ORDER BY mc.created_at
+		`,
+			[channelId]
+		);
+		res.status(200).send({ chats });
+	} catch (err) {
+		res.status(500).send(err);
+	}
+});
+
+app.get('/userchats', async (req, res) => {
+	try {
+		const user1 = Number(req.query.user_id_1);
+		const user2 = Number(req.query.user_id_2);
+		if (!user1 || !user2) {
+			return res.status(400).send({ message: 'Please provide user id' });
+		}
+		const chats = await dbquery(
+			`
+			SELECT mu.id, mu.user_id_1 as user_id, mu.message, mu.created_at, u.name as username
+			FROM message_users mu JOIN users u
+			ON mu.user_id_1 = u.id
+			WHERE (user_id_1=? AND user_id_2=?) OR (user_id_1=? AND user_id_2=?)
+		`,
+			[user1, user2, user2, user1]
+		);
+		res.status(200).send({ chats });
+	} catch (err) {
+		res.status(500).send(err);
+	}
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
 let pingpongInterval = null;
 
-function generateId() {
-	if (usersList.length === 0) return 1;
-	return usersList.map((user) => user.id).sort((a, b) => b - a)[0] + 1;
-}
+async function chatHandler(currentSocket, data) {
+	try {
+		const { target, broadcast, message } = data;
+		let chat, channelUsers, insert;
 
-function chatHandler(currentSocket, data) {
-	const { target, broadcast, message } = data;
-	if (broadcast) {
-		return wss.clients.forEach((socket) => {
-			if (socket.readyState === WebSocket.OPEN && socket !== currentSocket) {
+		if (broadcast) {
+			chat = {
+				channel_id: target,
+				user_id: currentSocket.user.id,
+				message,
+				created_at: currentTime(),
+			};
+			insert = await dbquery(`INSERT INTO message_channels SET ?`, chat);
+			channelUsers = await dbquery(
+				`SELECT * FROM channel_users WHERE channel_id = ?`,
+				[target]
+			);
+			return wss.clients.forEach((socket) => {
+				if (
+					socket.readyState === WebSocket.OPEN &&
+					socket !== currentSocket &&
+					channelUsers
+						.map((channel) => channel.user_id)
+						.includes(socket.user.id)
+				) {
+					socket.send(
+						JSON.stringify({
+							event: 'chat',
+							data: {
+								...chat,
+								username: currentSocket.user.name,
+								id: insert.insertId,
+							},
+						})
+					);
+				}
+			});
+		}
+
+		return wss.clients.forEach(async (socket) => {
+			if (socket.user.id === target) {
+				chat = {
+					message,
+					created_at: currentTime(),
+				};
+				insert = await dbquery(`INSERT INTO message_users SET ?`, {
+					user_id_1: currentSocket.user.id,
+					user_id_2: socket.user.id,
+					...chat,
+				});
 				socket.send(
 					JSON.stringify({
 						event: 'chat',
-						data: message,
+						data: {
+							id: insert.insertId,
+							user_id: currentSocket.user.id,
+							user_id_2: socket.user.id,
+							username: currentSocket.user.name,
+							...chat,
+						},
 					})
 				);
 			}
 		});
+	} catch (err) {
+		console.log(err);
 	}
-	const targetSocket = wss.clients.find((socket) => socket.user.id === target);
-	targetSocket.send(
-		JSON.stringify({
-			event: 'chat',
-			data: message,
-		})
-	);
 }
 
-function broadcastUsersList() {
-	wss.clients.forEach((socket) => {
-		if (socket.readyState === WebSocket.OPEN) {
-			const list = usersList.filter((user) => user.id !== socket.user.id);
-			socket.send(
-				JSON.stringify({
-					event: 'users_list',
-					data: { usersList: list },
-				})
-			);
-		}
-	});
-}
-
-function userDisconnect(socket) {
-	if (socket.user) {
-		const index = usersList.findIndex((user) => user.id === socket.user.id);
-		usersList.splice(index, 1, {
-			...usersList[index],
-			status: 0,
+async function broadcastUsersList() {
+	try {
+		const users = await dbquery(`SELECT * FROM users`);
+		wss.clients.forEach((socket) => {
+			if (socket.readyState === WebSocket.OPEN) {
+				const list = users.filter((user) => user.id !== socket.user.id);
+				socket.send(
+					JSON.stringify({
+						event: 'users_list',
+						data: list,
+					})
+				);
+			}
 		});
+	} catch (err) {
+		console.log(err);
 	}
-	socket.terminate();
-	console.log(`user ${socket.user.name} is disconnected`);
-	broadcastUsersList();
 }
 
-function userRegister(socket, data) {
-	const name = new RegExp(data.name, 'i');
-	const index = usersList.findIndex((user) => user.name.match(name));
-	let user;
-	// WILL ADD USERNAME IF NAME IS NOT LISTED
-	// WILL MAKE STATUS ONLINE IF NAME IS ALREADY LISTED
-	if (index >= 0) {
-		user = { ...usersList[index], status: 1 };
-		usersList.splice(index, 1, user);
-	} else {
-		user = {
-			id: generateId(),
-			name: data.name,
-			status: 1,
-		};
-		usersList.push(user);
+async function userDisconnect(socket) {
+	try {
+		const update = await dbquery(`UPDATE users SET ? WHERE id = ?`, [
+			{
+				status: 0,
+				updated_at: currentTime(),
+			},
+			socket.user.id,
+		]);
+		console.log(update);
+		socket.terminate();
+		console.log(`user ${socket.user.name} is disconnected`);
+		broadcastUsersList();
+	} catch (err) {
+		console.log(err);
 	}
+}
+
+function userJoin(socket, user) {
 	socket.user = user;
 	console.log(`user ${socket.user.name} is connected`);
-	socket.send(
-		JSON.stringify({ event: 'current_user', data: { currentUser: user } })
-	);
 	broadcastUsersList();
 }
 
@@ -128,8 +248,8 @@ wss.on('connection', (socket) => {
 			case 'pong':
 				console.log('pong');
 				return (socket.isAlive = true);
-			case 'register':
-				return userRegister(socket, data);
+			case 'join':
+				return userJoin(socket, data);
 			case 'chat':
 				return chatHandler(socket, data);
 			default:
