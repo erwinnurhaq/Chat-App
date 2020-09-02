@@ -1,15 +1,28 @@
 const http = require('http');
 const express = require('express');
+const dotenv = require('dotenv').config()
 const WebSocket = require('ws');
+// const db = require('./config/database')
+// const util = require('util')
+// const dbquery = util.promisify(db.query).bind(db)
 
 const port = process.env.PORT || 2000;
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-app.use('/', (req, res) => {
+app.get('/', (req, res) => {
 	res.status(200).send({ message: 'server on', status: 200 });
 });
+
+// app.get('/users', async (req, res) => {
+// 	try {
+// 		const users = await dbquery(`SELECT * FROM users`)
+// 		res.status(200).send(users)
+// 	} catch (error) {
+// 		res.status(500).send(error)
+// 	}
+// })
 
 const usersList = [];
 let pingpongInterval = null;
@@ -22,7 +35,7 @@ function generateId() {
 function chatHandler(currentSocket, data) {
 	const { target, broadcast, message } = data;
 	if (broadcast) {
-		wss.clients.forEach((socket) => {
+		return wss.clients.forEach((socket) => {
 			if (socket.readyState === WebSocket.OPEN && socket !== currentSocket) {
 				socket.send(
 					JSON.stringify({
@@ -33,6 +46,13 @@ function chatHandler(currentSocket, data) {
 			}
 		});
 	}
+	const targetSocket = wss.clients.find((socket) => socket.user.id === target);
+	targetSocket.send(
+		JSON.stringify({
+			event: 'chat',
+			data: message,
+		})
+	);
 }
 
 function broadcastUsersList() {
@@ -54,7 +74,7 @@ function userDisconnect(socket) {
 		const index = usersList.findIndex((user) => user.id === socket.user.id);
 		usersList.splice(index, 1, {
 			...usersList[index],
-			online: false,
+			status: 0,
 		});
 	}
 	socket.terminate();
@@ -69,13 +89,13 @@ function userRegister(socket, data) {
 	// WILL ADD USERNAME IF NAME IS NOT LISTED
 	// WILL MAKE STATUS ONLINE IF NAME IS ALREADY LISTED
 	if (index >= 0) {
-		user = { ...usersList[index], online: true };
+		user = { ...usersList[index], status: 1 };
 		usersList.splice(index, 1, user);
 	} else {
 		user = {
 			id: generateId(),
 			name: data.name,
-			online: true,
+			status: 1,
 		};
 		usersList.push(user);
 	}

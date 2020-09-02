@@ -24,7 +24,6 @@ function Main() {
 		online: [],
 		offline: [],
 	});
-
 	
 	function selectedChannelChange(val) {
 		setChats([])
@@ -85,8 +84,8 @@ function Main() {
 					return setChats(prev => [...prev, data]);
 				case 'users_list':
 					return setUsersList({
-						online: data.usersList.filter((user) => user.online),
-						offline: data.usersList.filter((user) => !user.online),
+						online: data.usersList.filter((user) => user.status === 1),
+						offline: data.usersList.filter((user) => user.status === 0),
 					});
 				case 'current_user':
 					return setCurrentUser(data.currentUser);
